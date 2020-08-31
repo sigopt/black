@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     import colorama  # noqa: F401
 
 DEFAULT_LINE_LENGTH = 88
-DEFAULT_EXCLUDES = r"/(\.eggs|\.git|\.hg|\.mypy_cache|\.nox|\.tox|\.venv|\.svn|_build|buck-out|build|dist)/"  # noqa: B950
+DEFAULT_EXCLUDES = r"/(\.direnv|\.eggs|\.git|\.hg|\.mypy_cache|\.nox|\.tox|\.venv|\.svn|_build|buck-out|build|dist)/"  # noqa: B950
 DEFAULT_INCLUDES = r"\.pyi?$"
 CACHE_DIR = Path(user_cache_dir("black", version=__version__))
 
@@ -195,6 +195,7 @@ class Feature(Enum):
     ASYNC_KEYWORDS = 7
     ASSIGNMENT_EXPRESSIONS = 8
     POS_ONLY_ARGUMENTS = 9
+    FORCE_OPTIONAL_PARENTHESES = 50
 
 
 VERSION_TO_FEATURES: Dict[TargetVersion, Set[Feature]] = {
@@ -240,6 +241,7 @@ class Mode:
     target_versions: Set[TargetVersion] = field(default_factory=set)
     line_length: int = DEFAULT_LINE_LENGTH
     string_normalization: bool = True
+    experimental_string_processing: bool = False
     is_pyi: bool = False
 
     def get_cache_key(self) -> str:
@@ -377,6 +379,15 @@ def target_version_option_callback(
     help="Don't normalize string quotes or prefixes.",
 )
 @click.option(
+    "--experimental-string-processing",
+    is_flag=True,
+    hidden=True,
+    help=(
+        "Experimental option that performs more normalization on string literals."
+        " Currently disabled because it leads to some crashes."
+    ),
+)
+@click.option(
     "--check",
     is_flag=True,
     help=(
@@ -471,7 +482,7 @@ def target_version_option_callback(
     ),
     is_eager=True,
     callback=read_pyproject_toml,
-    help="Read configuration from PATH.",
+    help="Read configuration from FILE path.",
 )
 @click.pass_context
 def main(
@@ -485,6 +496,7 @@ def main(
     fast: bool,
     pyi: bool,
     skip_string_normalization: bool,
+    experimental_string_processing: bool,
     quiet: bool,
     verbose: bool,
     include: str,
@@ -505,6 +517,7 @@ def main(
         line_length=line_length,
         is_pyi=pyi,
         string_normalization=not skip_string_normalization,
+        experimental_string_processing=experimental_string_processing,
     )
     if config and verbose:
         out(f"Using configuration from {config}.", bold=False, fg="blue")
@@ -583,9 +596,7 @@ def get_sources(
     root = find_project_root(src)
     sources: Set[Path] = set()
     path_empty(src, "No Path provided. Nothing to do 😴", quiet, verbose, ctx)
-    exclude_regexes = [exclude_regex]
-    if force_exclude_regex is not None:
-        exclude_regexes.append(force_exclude_regex)
+    gitignore = get_gitignore(root)
 
     for s in src:
         p = Path(s)
@@ -595,19 +606,30 @@ def get_sources(
                     p.iterdir(),
                     root,
                     include_regex,
-                    exclude_regexes,
+                    exclude_regex,
+                    force_exclude_regex,
                     report,
-                    get_gitignore(root),
+                    gitignore,
                 )
             )
         elif s == "-":
             sources.add(p)
         elif p.is_file():
-            sources.update(
-                gen_python_files(
-                    [p], root, None, exclude_regexes, report, get_gitignore(root)
-                )
-            )
+            normalized_path = normalize_path_maybe_ignore(p, root, report)
+            if normalized_path is None:
+                continue
+
+            normalized_path = "/" + normalized_path
+            # Hard-exclude any files that matches the `--force-exclude` regex.
+            if force_exclude_regex:
+                force_exclude_match = force_exclude_regex.search(normalized_path)
+            else:
+                force_exclude_match = None
+            if force_exclude_match and force_exclude_match.group(0):
+                report.path_ignored(p, "matches the --force-exclude regular expression")
+                continue
+
+            sources.add(p)
         else:
             err(f"invalid path: {s}")
     return sources
@@ -655,6 +677,8 @@ def reformat_one(
                 write_cache(cache, [src], mode)
         report.done(src, changed)
     except Exception as exc:
+        if report.verbose:
+            traceback.print_exc()
         report.failed(src, str(exc))
 
 
@@ -929,6 +953,7 @@ def format_str(src_contents: str, *, mode: Mode) -> FileContent:
         ...
 
     A more complex example:
+
     >>> print(
     ...   black.format_str(
     ...     "def f(arg:str='')->None: hey",
@@ -973,10 +998,7 @@ def format_str(src_contents: str, *, mode: Mode) -> FileContent:
         before, after = elt.maybe_empty_lines(current_line)
         dst_contents.append(str(empty_line) * before)
         for line in transform_line(
-            current_line,
-            line_length=mode.line_length,
-            normalize_strings=mode.string_normalization,
-            features=split_line_features,
+            current_line, mode=mode, features=split_line_features
         ):
             dst_contents.append(str(line))
     return "".join(dst_contents)
@@ -1263,6 +1285,7 @@ class BracketTracker:
     previous: Optional[Leaf] = None
     _for_loop_depths: List[int] = field(default_factory=list)
     _lambda_argument_depths: List[int] = field(default_factory=list)
+    invisible: List[Leaf] = field(default_factory=list)
 
     def mark(self, leaf: Leaf) -> None:
         """Mark `leaf` with bracket-related metadata. Keep track of delimiters.
@@ -1288,6 +1311,8 @@ class BracketTracker:
             self.depth -= 1
             opening_bracket = self.bracket_match.pop((self.depth, leaf.type))
             leaf.opening_bracket = opening_bracket
+            if not leaf.value:
+                self.invisible.append(leaf)
         leaf.bracket_depth = self.depth
         if self.depth == 0:
             delim = is_split_before_delimiter(leaf, self.previous)
@@ -1300,6 +1325,8 @@ class BracketTracker:
         if leaf.type in OPENING_BRACKETS:
             self.bracket_match[self.depth, BRACKET[leaf.type]] = leaf
             self.depth += 1
+            if not leaf.value:
+                self.invisible.append(leaf)
         self.previous = leaf
         self.maybe_increment_lambda_arguments(leaf)
         self.maybe_increment_for_loop_variable(leaf)
@@ -1421,7 +1448,8 @@ class Line:
             )
         if self.inside_brackets or not preformatted:
             self.bracket_tracker.mark(leaf)
-            self.maybe_remove_trailing_comma(leaf)
+            if self.maybe_should_explode(leaf):
+                self.should_explode = True
         if not self.append_comment(leaf):
             self.leaves.append(leaf)
 
@@ -1472,69 +1500,6 @@ class Line:
         return self.is_class and self.leaves[-3:] == [
             Leaf(token.DOT, ".") for _ in range(3)
         ]
-
-    @property
-    def is_collection_with_optional_trailing_comma(self) -> bool:
-        """Is this line a collection literal with a trailing comma that's optional?
-
-        Note that the trailing comma in a 1-tuple is not optional.
-        """
-        if not self.leaves or len(self.leaves) < 4:
-            return False
-
-        # Look for and address a trailing colon.
-        if self.leaves[-1].type == token.COLON:
-            closer = self.leaves[-2]
-            close_index = -2
-        else:
-            closer = self.leaves[-1]
-            close_index = -1
-        if closer.type not in CLOSING_BRACKETS or self.inside_brackets:
-            return False
-
-        if closer.type == token.RPAR:
-            # Tuples require an extra check, because if there's only
-            # one element in the tuple removing the comma unmakes the
-            # tuple.
-            #
-            # We also check for parens before looking for the trailing
-            # comma because in some cases (eg assigning a dict
-            # literal) the literal gets wrapped in temporary parens
-            # during parsing. This case is covered by the
-            # collections.py test data.
-            opener = closer.opening_bracket
-            for _open_index, leaf in enumerate(self.leaves):
-                if leaf is opener:
-                    break
-
-            else:
-                # Couldn't find the matching opening paren, play it safe.
-                return False
-
-            commas = 0
-            comma_depth = self.leaves[close_index - 1].bracket_depth
-            for leaf in self.leaves[_open_index + 1 : close_index]:
-                if leaf.bracket_depth == comma_depth and leaf.type == token.COMMA:
-                    commas += 1
-            if commas > 1:
-                # We haven't looked yet for the trailing comma because
-                # we might also have caught noop parens.
-                return self.leaves[close_index - 1].type == token.COMMA
-
-            elif commas == 1:
-                return False  # it's either a one-tuple or didn't have a trailing comma
-
-            if self.leaves[close_index - 1].type in CLOSING_BRACKETS:
-                close_index -= 1
-                closer = self.leaves[close_index]
-                if closer.type == token.RPAR:
-                    # TODO: this is a gut feeling. Will we ever see this?
-                    return False
-
-        if self.leaves[close_index - 1].type != token.COMMA:
-            return False
-
-        return True
 
     @property
     def is_def(self) -> bool:
@@ -1660,42 +1625,28 @@ class Line:
     def contains_multiline_strings(self) -> bool:
         return any(is_multiline_string(leaf) for leaf in self.leaves)
 
-    def maybe_remove_trailing_comma(self, closing: Leaf) -> bool:
-        """Remove trailing comma if there is one and it's safe."""
-        if not (self.leaves and self.leaves[-1].type == token.COMMA):
-            return False
-
-        # We remove trailing commas only in the case of importing a
-        # single name from a module.
+    def maybe_should_explode(self, closing: Leaf) -> bool:
+        """Return True if this line should explode (always be split), that is when:
+        - there's a trailing comma here; and
+        - it's not a one-tuple.
+        """
         if not (
-            self.leaves
-            and self.is_import
-            and len(self.leaves) > 4
+            closing.type in CLOSING_BRACKETS
+            and self.leaves
             and self.leaves[-1].type == token.COMMA
-            and closing.type in CLOSING_BRACKETS
-            and self.leaves[-4].type == token.NAME
-            and (
-                # regular `from foo import bar,`
-                self.leaves[-4].value == "import"
-                # `from foo import (bar as baz,)
-                or (
-                    len(self.leaves) > 6
-                    and self.leaves[-6].value == "import"
-                    and self.leaves[-3].value == "as"
-                )
-                # `from foo import bar as baz,`
-                or (
-                    len(self.leaves) > 5
-                    and self.leaves[-5].value == "import"
-                    and self.leaves[-3].value == "as"
-                )
-            )
-            and closing.type == token.RPAR
         ):
             return False
 
-        self.remove_trailing_comma()
-        return True
+        if closing.type in {token.RBRACE, token.RSQB}:
+            return True
+
+        if self.is_import:
+            return True
+
+        if not is_one_tuple_between(closing.opening_bracket, closing, self.leaves):
+            return True
+
+        return False
 
     def append_comment(self, comment: Leaf) -> bool:
         """Add an inline or standalone comment to the line."""
@@ -2085,13 +2036,20 @@ class LineGenerator(Visitor[Line]):
         yield from self.visit_default(node)
 
     def visit_STRING(self, leaf: Leaf) -> Iterator[Line]:
-        # Check if it's a docstring
-        if prev_siblings_are(
-            leaf.parent, [None, token.NEWLINE, token.INDENT, syms.simple_stmt]
-        ) and is_multiline_string(leaf):
-            prefix = "  " * self.current_line.depth
-            docstring = fix_docstring(leaf.value[3:-3], prefix)
-            leaf.value = leaf.value[0:3] + docstring + leaf.value[-3:]
+        if is_docstring(leaf) and "\\\n" not in leaf.value:
+            # We're ignoring docstrings with backslash newline escapes because changing
+            # indentation of those changes the AST representation of the code.
+            prefix = get_string_prefix(leaf.value)
+            lead_len = len(prefix) + 3
+            tail_len = -3
+            indent = " " * 4 * self.current_line.depth
+            docstring = fix_docstring(leaf.value[lead_len:tail_len], indent)
+            if docstring:
+                if leaf.value[lead_len - 1] == docstring[0]:
+                    docstring = " " + docstring
+                if leaf.value[tail_len + 1] == docstring[-1]:
+                    docstring = docstring + " "
+            leaf.value = leaf.value[0:lead_len] + docstring + leaf.value[tail_len:]
             normalize_string_quotes(leaf)
 
         yield from self.visit_default(leaf)
@@ -2638,10 +2596,7 @@ def make_comment(content: str) -> str:
 
 
 def transform_line(
-    line: Line,
-    line_length: int,
-    normalize_strings: bool,
-    features: Collection[Feature] = (),
+    line: Line, mode: Mode, features: Collection[Feature] = ()
 ) -> Iterator[Line]:
     """Transform a `line`, potentially splitting it into many lines.
 
@@ -2657,7 +2612,7 @@ def transform_line(
 
     def init_st(ST: Type[StringTransformer]) -> StringTransformer:
         """Initialize StringTransformer"""
-        return ST(line_length, normalize_strings)
+        return ST(mode.line_length, mode.string_normalization)
 
     string_merge = init_st(StringMerger)
     string_paren_strip = init_st(StringParenStripper)
@@ -2668,72 +2623,79 @@ def transform_line(
     if (
         not line.contains_uncollapsable_type_comments()
         and not line.should_explode
-        and not line.is_collection_with_optional_trailing_comma
         and (
-            is_line_short_enough(line, line_length=line_length, line_str=line_str)
+            is_line_short_enough(line, line_length=mode.line_length, line_str=line_str)
             or line.contains_unsplittable_type_ignore()
         )
-        and not (line.contains_standalone_comments() and line.inside_brackets)
+        and not (line.inside_brackets and line.contains_standalone_comments())
     ):
         # Only apply basic string preprocessing, since lines shouldn't be split here.
-        transformers = [string_merge, string_paren_strip]
+        if mode.experimental_string_processing:
+            transformers = [string_merge, string_paren_strip]
+        else:
+            transformers = []
     elif line.is_def:
         transformers = [left_hand_split]
     else:
 
         def rhs(line: Line, features: Collection[Feature]) -> Iterator[Line]:
-            for omit in generate_trailers_to_omit(line, line_length):
-                lines = list(right_hand_split(line, line_length, features, omit=omit))
-                if is_line_short_enough(lines[0], line_length=line_length):
+            """Wraps calls to `right_hand_split`.
+
+            The calls increasingly `omit` right-hand trailers (bracket pairs with
+            content), meaning the trailers get glued together to split on another
+            bracket pair instead.
+            """
+            for omit in generate_trailers_to_omit(line, mode.line_length):
+                lines = list(
+                    right_hand_split(line, mode.line_length, features, omit=omit)
+                )
+                # Note: this check is only able to figure out if the first line of the
+                # *current* transformation fits in the line length.  This is true only
+                # for simple cases.  All others require running more transforms via
+                # `transform_line()`.  This check doesn't know if those would succeed.
+                if is_line_short_enough(lines[0], line_length=mode.line_length):
                     yield from lines
                     return
 
             # All splits failed, best effort split with no omits.
             # This mostly happens to multiline strings that are by definition
-            # reported as not fitting a single line.
-            # line_length=1 here was historically a bug that somehow became a feature.
-            # See #762 and #781 for the full story.
-            yield from right_hand_split(line, line_length=1, features=features)
+            # reported as not fitting a single line, as well as lines that contain
+            # trailing commas (those have to be exploded).
+            yield from right_hand_split(
+                line, line_length=mode.line_length, features=features
+            )
 
-        if line.inside_brackets:
-            transformers = [
-                string_merge,
-                string_paren_strip,
-                delimiter_split,
-                standalone_comment_split,
-                string_split,
-                string_paren_wrap,
-                rhs,
-            ]
+        if mode.experimental_string_processing:
+            if line.inside_brackets:
+                transformers = [
+                    string_merge,
+                    string_paren_strip,
+                    delimiter_split,
+                    standalone_comment_split,
+                    string_split,
+                    string_paren_wrap,
+                    rhs,
+                ]
+            else:
+                transformers = [
+                    string_merge,
+                    string_paren_strip,
+                    string_split,
+                    string_paren_wrap,
+                    rhs,
+                ]
         else:
-            transformers = [
-                string_merge,
-                string_paren_strip,
-                string_split,
-                string_paren_wrap,
-                rhs,
-            ]
+            if line.inside_brackets:
+                transformers = [delimiter_split, standalone_comment_split, rhs]
+            else:
+                transformers = [rhs]
 
     for transform in transformers:
         # We are accumulating lines in `result` because we might want to abort
         # mission and return the original line in the end, or attempt a different
         # split altogether.
-        result: List[Line] = []
         try:
-            for transformed_line in transform(line, features):
-                if str(transformed_line).strip("\n") == line_str:
-                    raise CannotTransform(
-                        "Line transformer returned an unchanged result"
-                    )
-
-                result.extend(
-                    transform_line(
-                        transformed_line,
-                        line_length=line_length,
-                        normalize_strings=normalize_strings,
-                        features=features,
-                    )
-                )
+            result = run_transformer(line, transform, mode, features, line_str=line_str)
         except CannotTransform:
             continue
         else:
@@ -2774,6 +2736,7 @@ class StringTransformer(ABC):
 
     line_length: int
     normalize_strings: bool
+    __name__ = "StringTransformer"
 
     @abstractmethod
     def do_match(self, line: Line) -> TMatchResult:
@@ -3020,7 +2983,7 @@ class StringMerger(CustomSplitMapMixin, StringTransformer):
             )
 
         new_line = line.clone()
-        new_line.comments = line.comments
+        new_line.comments = line.comments.copy()
         append_leaves(new_line, line, LL)
 
         new_string_leaf = new_line.leaves[string_idx]
@@ -3238,7 +3201,9 @@ class StringParenStripper(StringTransformer):
     Requirements:
         The line contains a string which is surrounded by parentheses and:
             - The target string is NOT the only argument to a function call).
-            - The RPAR is NOT followed by an attribute access (i.e. a dot).
+            - If the target string contains a PERCENT, the brackets are not
+              preceeded or followed by an operator with higher precedence than
+              PERCENT.
 
     Transformations:
         The parentheses mentioned in the 'Requirements' section are stripped.
@@ -3281,14 +3246,51 @@ class StringParenStripper(StringTransformer):
             string_parser = StringParser()
             next_idx = string_parser.parse(LL, string_idx)
 
+            # if the leaves in the parsed string include a PERCENT, we need to
+            # make sure the initial LPAR is NOT preceded by an operator with
+            # higher or equal precedence to PERCENT
+            if is_valid_index(idx - 2):
+                # mypy can't quite follow unless we name this
+                before_lpar = LL[idx - 2]
+                if token.PERCENT in {leaf.type for leaf in LL[idx - 1 : next_idx]} and (
+                    (
+                        before_lpar.type
+                        in {
+                            token.STAR,
+                            token.AT,
+                            token.SLASH,
+                            token.DOUBLESLASH,
+                            token.PERCENT,
+                            token.TILDE,
+                            token.DOUBLESTAR,
+                            token.AWAIT,
+                            token.LSQB,
+                            token.LPAR,
+                        }
+                    )
+                    or (
+                        # only unary PLUS/MINUS
+                        before_lpar.parent
+                        and before_lpar.parent.type == syms.factor
+                        and (before_lpar.type in {token.PLUS, token.MINUS})
+                    )
+                ):
+                    continue
+
             # Should be followed by a non-empty RPAR...
             if (
                 is_valid_index(next_idx)
                 and LL[next_idx].type == token.RPAR
                 and not is_empty_rpar(LL[next_idx])
             ):
-                # That RPAR should NOT be followed by a '.' symbol.
-                if is_valid_index(next_idx + 1) and LL[next_idx + 1].type == token.DOT:
+                # That RPAR should NOT be followed by anything with higher
+                # precedence than PERCENT
+                if is_valid_index(next_idx + 1) and LL[next_idx + 1].type in {
+                    token.DOUBLESTAR,
+                    token.LSQB,
+                    token.LPAR,
+                    token.DOT,
+                }:
                     continue
 
                 return Ok(string_idx)
@@ -3309,7 +3311,6 @@ class StringParenStripper(StringTransformer):
 
         new_line = line.clone()
         new_line.comments = line.comments.copy()
-
         append_leaves(new_line, line, LL[: string_idx - 1])
 
         string_leaf = Leaf(token.STRING, LL[string_idx].value)
@@ -3318,7 +3319,7 @@ class StringParenStripper(StringTransformer):
         new_line.append(string_leaf)
 
         append_leaves(
-            new_line, line, LL[string_idx + 1 : rpar_idx] + LL[rpar_idx + 1 :],
+            new_line, line, LL[string_idx + 1 : rpar_idx] + LL[rpar_idx + 1 :]
         )
 
         LL[rpar_idx].remove()
@@ -4594,8 +4595,6 @@ def append_leaves(new_line: Line, old_line: Line, leaves: List[Leaf]) -> None:
         set(@leaves) is a subset of set(@old_line.leaves).
     """
     for old_leaf in leaves:
-        assert old_leaf in old_line.leaves
-
         new_leaf = Leaf(old_leaf.type, old_leaf.value)
         replace_child(old_leaf, new_leaf)
         new_line.append(new_leaf)
@@ -4755,8 +4754,7 @@ def right_hand_split(
     tail = bracket_split_build_line(tail_leaves, line, opening_bracket)
     bracket_split_succeeded_or_raise(head, body, tail)
     if (
-        # the body shouldn't be exploded
-        not body.should_explode
+        Feature.FORCE_OPTIONAL_PARENTHESES not in features
         # the opening bracket is an optional paren
         and opening_bracket.type == token.LPAR
         and not opening_bracket.value
@@ -4769,7 +4767,7 @@ def right_hand_split(
         # there are no standalone comments in the body
         and not body.contains_standalone_comments(0)
         # and we can actually remove the parens
-        and can_omit_invisible_parens(body, line_length)
+        and can_omit_invisible_parens(body, line_length, omit_on_explode=omit)
     ):
         omit = {id(closing_bracket), *omit}
         try:
@@ -4855,7 +4853,8 @@ def bracket_split_build_line(
                         continue
 
                     if leaves[i].type != token.COMMA:
-                        leaves.insert(i + 1, Leaf(token.COMMA, ","))
+                        new_comma = Leaf(token.COMMA, ",")
+                        leaves.insert(i + 1, new_comma)
                     break
 
     # Populate the line
@@ -4863,8 +4862,8 @@ def bracket_split_build_line(
         result.append(leaf, preformatted=True)
         for comment_after in original.comments_after(leaf):
             result.append(comment_after, preformatted=True)
-    if is_body:
-        result.should_explode = should_explode(result, opening_bracket)
+    if is_body and should_split_body_explode(result, opening_bracket):
+        result.should_explode = True
     return result
 
 
@@ -4949,7 +4948,8 @@ def delimiter_split(line: Line, features: Collection[Feature] = ()) -> Iterator[
             and current_line.leaves[-1].type != token.COMMA
             and current_line.leaves[-1].type != STANDALONE_COMMENT
         ):
-            current_line.append(Leaf(token.COMMA, ","))
+            new_comma = Leaf(token.COMMA, ",")
+            current_line.append(new_comma)
         yield current_line
 
 
@@ -5571,24 +5571,63 @@ def ensure_visible(leaf: Leaf) -> None:
         leaf.value = ")"
 
 
-def should_explode(line: Line, opening_bracket: Leaf) -> bool:
-    """Should `line` immediately be split with `delimiter_split()` after RHS?"""
+def should_split_body_explode(line: Line, opening_bracket: Leaf) -> bool:
+    """Should `line` be immediately split with `delimiter_split()` after RHS?"""
 
-    if not (
-        opening_bracket.parent
-        and opening_bracket.parent.type in {syms.atom, syms.import_from}
-        and opening_bracket.value in "[{("
-    ):
+    if not (opening_bracket.parent and opening_bracket.value in "[{("):
         return False
 
+    # We're essentially checking if the body is delimited by commas and there's more
+    # than one of them (we're excluding the trailing comma and if the delimiter priority
+    # is still commas, that means there's more).
+    exclude = set()
+    trailing_comma = False
     try:
         last_leaf = line.leaves[-1]
-        exclude = {id(last_leaf)} if last_leaf.type == token.COMMA else set()
+        if last_leaf.type == token.COMMA:
+            trailing_comma = True
+            exclude.add(id(last_leaf))
         max_priority = line.bracket_tracker.max_delimiter_priority(exclude=exclude)
     except (IndexError, ValueError):
         return False
 
-    return max_priority == COMMA_PRIORITY
+    return max_priority == COMMA_PRIORITY and (
+        trailing_comma
+        # always explode imports
+        or opening_bracket.parent.type in {syms.atom, syms.import_from}
+    )
+
+
+def is_one_tuple_between(opening: Leaf, closing: Leaf, leaves: List[Leaf]) -> bool:
+    """Return True if content between `opening` and `closing` looks like a one-tuple."""
+    if opening.type != token.LPAR and closing.type != token.RPAR:
+        return False
+
+    depth = closing.bracket_depth + 1
+    for _opening_index, leaf in enumerate(leaves):
+        if leaf is opening:
+            break
+
+    else:
+        raise LookupError("Opening paren not found in `leaves`")
+
+    commas = 0
+    _opening_index += 1
+    for leaf in leaves[_opening_index:]:
+        if leaf is closing:
+            break
+
+        bracket_depth = leaf.bracket_depth
+        if bracket_depth == depth and leaf.type == token.COMMA:
+            commas += 1
+            if leaf.parent and leaf.parent.type in {
+                syms.arglist,
+                syms.typedargslist,
+            }:
+                commas += 1
+                break
+
+    return commas < 2
 
 
 def get_features_used(node: Node) -> Set[Feature]:
@@ -5655,11 +5694,13 @@ def generate_trailers_to_omit(line: Line, line_length: int) -> Iterator[Set[Leaf
     a preceding closing bracket fits in one line.
 
     Yielded sets are cumulative (contain results of previous yields, too).  First
-    set is empty.
+    set is empty, unless the line should explode, in which case bracket pairs until
+    the one that needs to explode are omitted.
     """
 
     omit: Set[LeafID] = set()
-    yield omit
+    if not line.should_explode:
+        yield omit
 
     length = 4 * line.depth
     opening_bracket: Optional[Leaf] = None
@@ -5678,9 +5719,23 @@ def generate_trailers_to_omit(line: Line, line_length: int) -> Iterator[Set[Leaf
             if leaf is opening_bracket:
                 opening_bracket = None
             elif leaf.type in CLOSING_BRACKETS:
+                prev = line.leaves[index - 1] if index > 0 else None
+                if (
+                    line.should_explode
+                    and prev
+                    and prev.type == token.COMMA
+                    and not is_one_tuple_between(
+                        leaf.opening_bracket, leaf, line.leaves
+                    )
+                ):
+                    # Never omit bracket pairs with trailing commas.
+                    # We need to explode on those.
+                    break
+
                 inner_brackets.add(id(leaf))
         elif leaf.type in CLOSING_BRACKETS:
-            if index > 0 and line.leaves[index - 1].type in OPENING_BRACKETS:
+            prev = line.leaves[index - 1] if index > 0 else None
+            if prev and prev.type in OPENING_BRACKETS:
                 # Empty brackets would fail a split so treat them as "inner"
                 # brackets (e.g. only add them to the `omit` set if another
                 # pair of brackets was good enough.
@@ -5692,6 +5747,16 @@ def generate_trailers_to_omit(line: Line, line_length: int) -> Iterator[Set[Leaf
                 omit.update(inner_brackets)
                 inner_brackets.clear()
                 yield omit
+
+            if (
+                line.should_explode
+                and prev
+                and prev.type == token.COMMA
+                and not is_one_tuple_between(leaf.opening_bracket, leaf, line.leaves)
+            ):
+                # Never omit bracket pairs with trailing commas.
+                # We need to explode on those.
+                break
 
             if leaf.value:
                 opening_bracket = leaf.opening_bracket
@@ -5759,16 +5824,40 @@ def get_gitignore(root: Path) -> PathSpec:
     return PathSpec.from_lines("gitwildmatch", lines)
 
 
+def normalize_path_maybe_ignore(
+    path: Path, root: Path, report: "Report"
+) -> Optional[str]:
+    """Normalize `path`. May return `None` if `path` was ignored.
+
+    `report` is where "path ignored" output goes.
+    """
+    try:
+        normalized_path = path.resolve().relative_to(root).as_posix()
+    except OSError as e:
+        report.path_ignored(path, f"cannot be read because {e}")
+        return None
+
+    except ValueError:
+        if path.is_symlink():
+            report.path_ignored(path, f"is a symbolic link that points outside {root}")
+            return None
+
+        raise
+
+    return normalized_path
+
+
 def gen_python_files(
     paths: Iterable[Path],
     root: Path,
     include: Optional[Pattern[str]],
-    exclude_regexes: Iterable[Pattern[str]],
+    exclude: Pattern[str],
+    force_exclude: Optional[Pattern[str]],
     report: "Report",
     gitignore: PathSpec,
 ) -> Iterator[Path]:
     """Generate all files under `path` whose paths are not excluded by the
-    `exclude` regex, but are included by the `include` regex.
+    `exclude_regex` or `force_exclude` regexes, but are included by the `include` regex.
 
     Symbolic links pointing outside of the `root` directory are ignored.
 
@@ -5776,43 +5865,41 @@ def gen_python_files(
     """
     assert root.is_absolute(), f"INTERNAL ERROR: `root` must be absolute but is {root}"
     for child in paths:
-        # Then ignore with `exclude` option.
-        try:
-            normalized_path = child.resolve().relative_to(root).as_posix()
-        except OSError as e:
-            report.path_ignored(child, f"cannot be read because {e}")
+        normalized_path = normalize_path_maybe_ignore(child, root, report)
+        if normalized_path is None:
             continue
-        except ValueError:
-            if child.is_symlink():
-                report.path_ignored(
-                    child, f"is a symbolic link that points outside {root}"
-                )
-                continue
-
-            raise
 
         # First ignore files matching .gitignore
         if gitignore.match_file(normalized_path):
             report.path_ignored(child, "matches the .gitignore file content")
             continue
 
+        # Then ignore with `--exclude` and `--force-exclude` options.
         normalized_path = "/" + normalized_path
         if child.is_dir():
             normalized_path += "/"
 
-        is_excluded = False
-        for exclude in exclude_regexes:
-            exclude_match = exclude.search(normalized_path) if exclude else None
-            if exclude_match and exclude_match.group(0):
-                report.path_ignored(child, "matches the --exclude regular expression")
-                is_excluded = True
-                break
-        if is_excluded:
+        exclude_match = exclude.search(normalized_path) if exclude else None
+        if exclude_match and exclude_match.group(0):
+            report.path_ignored(child, "matches the --exclude regular expression")
+            continue
+
+        force_exclude_match = (
+            force_exclude.search(normalized_path) if force_exclude else None
+        )
+        if force_exclude_match and force_exclude_match.group(0):
+            report.path_ignored(child, "matches the --force-exclude regular expression")
             continue
 
         if child.is_dir():
             yield from gen_python_files(
-                child.iterdir(), root, include, exclude_regexes, report, gitignore
+                child.iterdir(),
+                root,
+                include,
+                exclude,
+                force_exclude,
+                report,
+                gitignore,
             )
 
         elif child.is_file():
@@ -5825,8 +5912,8 @@ def gen_python_files(
 def find_project_root(srcs: Iterable[str]) -> Path:
     """Return a directory containing .git, .hg, or pyproject.toml.
 
-    That directory can be one of the directories passed in `srcs` or their
-    common parent.
+    That directory will be a common parent of all files and directories
+    passed in `srcs`.
 
     If no directory in the tree contains a marker that would specify it's the
     project root, the root of the file system is returned.
@@ -5834,11 +5921,20 @@ def find_project_root(srcs: Iterable[str]) -> Path:
     if not srcs:
         return Path("/").resolve()
 
-    common_base = min(Path(src).resolve() for src in srcs)
-    if common_base.is_dir():
-        # Append a fake file so `parents` below returns `common_base_dir`, too.
-        common_base /= "fake-file"
-    for directory in common_base.parents:
+    path_srcs = [Path(Path.cwd(), src).resolve() for src in srcs]
+
+    # A list of lists of parents for each 'src'. 'src' is included as a
+    # "parent" of itself if it is a directory
+    src_parents = [
+        list(path.parents) + ([path] if path.is_dir() else []) for path in path_srcs
+    ]
+
+    common_base = max(
+        set.intersection(*(set(parents) for parents in src_parents)),
+        key=lambda path: path.parts,
+    )
+
+    for directory in (common_base, *common_base.parents):
         if (directory / ".git").exists():
             return directory
 
@@ -6023,7 +6119,7 @@ def _stringify_ast(
                 and field == "value"
                 and isinstance(value, str)
             ):
-                normalized = re.sub(r" *\n[ \t]+", "\n ", value).strip()
+                normalized = re.sub(r" *\n[ \t]*", "\n", value).strip()
             else:
                 normalized = value
             yield f"{'  ' * (depth+2)}{normalized!r},  # {value.__class__.__name__}"
@@ -6067,6 +6163,7 @@ def assert_stable(src: str, dst: str, mode: Mode) -> None:
     newdst = format_str(dst, mode=mode)
     if dst != newdst:
         log = dump_to_file(
+            str(mode),
             diff(src, dst, "source", "first pass"),
             diff(dst, newdst, "first pass", "second pass"),
         )
@@ -6243,7 +6340,11 @@ def can_be_split(line: Line) -> bool:
     return True
 
 
-def can_omit_invisible_parens(line: Line, line_length: int) -> bool:
+def can_omit_invisible_parens(
+    line: Line,
+    line_length: int,
+    omit_on_explode: Collection[LeafID] = (),
+) -> bool:
     """Does `line` have a shape safe to reformat without optional parens around it?
 
     Returns True for only a subset of potentially nice looking formattings but
@@ -6266,36 +6367,26 @@ def can_omit_invisible_parens(line: Line, line_length: int) -> bool:
 
     assert len(line.leaves) >= 2, "Stranded delimiter"
 
-    first = line.leaves[0]
-    second = line.leaves[1]
-    penultimate = line.leaves[-2]
-    last = line.leaves[-1]
-
     # With a single delimiter, omit if the expression starts or ends with
     # a bracket.
+    first = line.leaves[0]
+    second = line.leaves[1]
     if first.type in OPENING_BRACKETS and second.type not in CLOSING_BRACKETS:
-        remainder = False
-        length = 4 * line.depth
-        for _index, leaf, leaf_length in enumerate_with_length(line):
-            if leaf.type in CLOSING_BRACKETS and leaf.opening_bracket is first:
-                remainder = True
-            if remainder:
-                length += leaf_length
-                if length > line_length:
-                    break
-
-                if leaf.type in OPENING_BRACKETS:
-                    # There are brackets we can further split on.
-                    remainder = False
-
-        else:
-            # checked the entire string and line length wasn't exceeded
-            if len(line.leaves) == _index + 1:
-                return True
+        if _can_omit_opening_paren(line, first=first, line_length=line_length):
+            return True
 
         # Note: we are not returning False here because a line might have *both*
         # a leading opening bracket and a trailing closing bracket.  If the
         # opening bracket doesn't match our rule, maybe the closing will.
+
+    penultimate = line.leaves[-2]
+    last = line.leaves[-1]
+    if line.should_explode:
+        try:
+            penultimate, last = last_two_except(line.leaves, omit=omit_on_explode)
+        except LookupError:
+            # Turns out we'd omit everything.  We cannot skip the optional parentheses.
+            return False
 
     if (
         last.type == token.RPAR
@@ -6317,19 +6408,118 @@ def can_omit_invisible_parens(line: Line, line_length: int) -> bool:
             # unnecessary.
             return True
 
-        length = 4 * line.depth
-        seen_other_brackets = False
-        for _index, leaf, leaf_length in enumerate_with_length(line):
-            length += leaf_length
-            if leaf is last.opening_bracket:
-                if seen_other_brackets or length <= line_length:
-                    return True
+        if line.should_explode and penultimate.type == token.COMMA:
+            # The rightmost non-omitted bracket pair is the one we want to explode on.
+            return True
 
-            elif leaf.type in OPENING_BRACKETS:
-                # There are brackets we can further split on.
-                seen_other_brackets = True
+        if _can_omit_closing_paren(line, last=last, line_length=line_length):
+            return True
 
     return False
+
+
+def _can_omit_opening_paren(line: Line, *, first: Leaf, line_length: int) -> bool:
+    """See `can_omit_invisible_parens`."""
+    remainder = False
+    length = 4 * line.depth
+    _index = -1
+    for _index, leaf, leaf_length in enumerate_with_length(line):
+        if leaf.type in CLOSING_BRACKETS and leaf.opening_bracket is first:
+            remainder = True
+        if remainder:
+            length += leaf_length
+            if length > line_length:
+                break
+
+            if leaf.type in OPENING_BRACKETS:
+                # There are brackets we can further split on.
+                remainder = False
+
+    else:
+        # checked the entire string and line length wasn't exceeded
+        if len(line.leaves) == _index + 1:
+            return True
+
+    return False
+
+
+def _can_omit_closing_paren(line: Line, *, last: Leaf, line_length: int) -> bool:
+    """See `can_omit_invisible_parens`."""
+    length = 4 * line.depth
+    seen_other_brackets = False
+    for _index, leaf, leaf_length in enumerate_with_length(line):
+        length += leaf_length
+        if leaf is last.opening_bracket:
+            if seen_other_brackets or length <= line_length:
+                return True
+
+        elif leaf.type in OPENING_BRACKETS:
+            # There are brackets we can further split on.
+            seen_other_brackets = True
+
+    return False
+
+
+def last_two_except(leaves: List[Leaf], omit: Collection[LeafID]) -> Tuple[Leaf, Leaf]:
+    """Return (penultimate, last) leaves skipping brackets in `omit` and contents."""
+    stop_after = None
+    last = None
+    for leaf in reversed(leaves):
+        if stop_after:
+            if leaf is stop_after:
+                stop_after = None
+            continue
+
+        if last:
+            return leaf, last
+
+        if id(leaf) in omit:
+            stop_after = leaf.opening_bracket
+        else:
+            last = leaf
+    else:
+        raise LookupError("Last two leaves were also skipped")
+
+
+def run_transformer(
+    line: Line,
+    transform: Transformer,
+    mode: Mode,
+    features: Collection[Feature],
+    *,
+    line_str: str = "",
+) -> List[Line]:
+    if not line_str:
+        line_str = line_to_string(line)
+    result: List[Line] = []
+    for transformed_line in transform(line, features):
+        if str(transformed_line).strip("\n") == line_str:
+            raise CannotTransform("Line transformer returned an unchanged result")
+
+        result.extend(transform_line(transformed_line, mode=mode, features=features))
+
+    if not (
+        transform.__name__ == "rhs"
+        and line.bracket_tracker.invisible
+        and not any(bracket.value for bracket in line.bracket_tracker.invisible)
+        and not line.contains_multiline_strings()
+        and not result[0].contains_uncollapsable_type_comments()
+        and not result[0].contains_unsplittable_type_ignore()
+        and not is_line_short_enough(result[0], line_length=mode.line_length)
+    ):
+        return result
+
+    line_copy = line.clone()
+    append_leaves(line_copy, line, line.leaves)
+    features_fop = set(features) | {Feature.FORCE_OPTIONAL_PARENTHESES}
+    second_opinion = run_transformer(
+        line_copy, transform, mode, features_fop, line_str=line_str
+    )
+    if all(
+        is_line_short_enough(ln, line_length=mode.line_length) for ln in second_opinion
+    ):
+        result = second_opinion
+    return result
 
 
 def get_cache_file(mode: Mode) -> Path:
@@ -6417,6 +6607,26 @@ def patched_main() -> None:
     main()
 
 
+def is_docstring(leaf: Leaf) -> bool:
+    if not is_multiline_string(leaf):
+        # For the purposes of docstring re-indentation, we don't need to do anything
+        # with single-line docstrings.
+        return False
+
+    if prev_siblings_are(
+        leaf.parent, [None, token.NEWLINE, token.INDENT, syms.simple_stmt]
+    ):
+        return True
+
+    # Multiline docstring on the same line as the `def`.
+    if prev_siblings_are(leaf.parent, [syms.parameters, token.COLON, syms.simple_stmt]):
+        # `syms.parameters` is only used in funcdefs and async_funcdefs in the Python
+        # grammar. We're safe to return True without further checks.
+        return True
+
+    return False
+
+
 def fix_docstring(docstring: str, prefix: str) -> str:
     # https://www.python.org/dev/peps/pep-0257/#handling-docstring-indentation
     if not docstring:
@@ -6440,7 +6650,6 @@ def fix_docstring(docstring: str, prefix: str) -> str:
                 trimmed.append(prefix + stripped_line)
             else:
                 trimmed.append("")
-    # Return a single string:
     return "\n".join(trimmed)
 
 

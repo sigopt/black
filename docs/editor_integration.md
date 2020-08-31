@@ -146,7 +146,7 @@ or you can copy the plugin from
 
 ```
 mkdir -p ~/.vim/pack/python/start/black/plugin
-curl https://raw.githubusercontent.com/psf/black/master/plugin/black.vim -o ~/.vim/pack/python/start/black/plugin/black.vim
+curl https://raw.githubusercontent.com/psf/black/stable/plugin/black.vim -o ~/.vim/pack/python/start/black/plugin/black.vim
 ```
 
 Let me know if this requires any changes to work with Vim 8's builtin `packadd`, or
@@ -255,6 +255,10 @@ Sublime Text, Visual Studio Code and many more), you can use the
 
 Use [python-black](https://atom.io/packages/python-black).
 
+## Gradle (the build tool)
+
+Use the [Spotless](https://github.com/diffplug/spotless/tree/main/plugin-gradle) plugin.
+
 ## Kakoune
 
 Add the following hook to your kakrc, then run _Black_ with `:format`.
@@ -269,9 +273,9 @@ hook global WinSetOption filetype=python %{
 
 Use [Thonny-black-code-format](https://github.com/Franccisco/thonny-black-code-format).
 
-## Other editors
+## Other integrations
 
-Other editors will require external contributions.
+Other editors and tools will require external contributions.
 
 Patches welcome! ✨ 🍰 ✨
 

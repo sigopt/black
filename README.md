@@ -51,6 +51,12 @@ _Contents:_ **[Installation and usage](#installation-and-usage)** |
 _Black_ can be installed by running `pip install black`. It requires Python 3.6.0+ to
 run but you can reformat Python 2 code with it, too.
 
+#### Install from GitHub
+
+If you can't wait for the latest _hotness_ and want to install from GitHub, use:
+
+`pip install git+git://github.com/psf/black`
+
 ### Usage
 
 To get started right away with sensible defaults:
@@ -137,7 +143,7 @@ Options:
                                   --exclude=.
 
   --version                       Show the version and exit.
-  --config FILE                   Read configuration from PATH.
+  --config FILE                   Read configuration from FILE path.
   -h, --help                      Show this message and exit.
 ```
 
@@ -287,7 +293,7 @@ the equivalent of r-strings in Python. Multiline strings are treated as verbose 
 expressions by Black. Use `[ ]` to denote a significant space character.
 
 <details>
-<summary>Example `pyproject.toml`</summary>
+<summary>Example <code>pyproject.toml</code></summary>
 
 ```toml
 [tool.black]
@@ -348,8 +354,8 @@ rolling.
 
 ## black-primer
 
-`black-primer` is a tool built for CI (and huumans) to have _Black_ `--check` a number
-of (configured in `primer.json`) Git accessible projects in parallel.
+`black-primer` is a tool built for CI (and humans) to have _Black_ `--check` a number of
+(configured in `primer.json`) Git accessible projects in parallel.
 [black_primer](https://github.com/psf/black/blob/master/docs/black_primer.md) has more
 information regarding its usage and configuration.
 
@@ -364,10 +370,10 @@ Use [pre-commit](https://pre-commit.com/). Once you
 ```yaml
 repos:
   - repo: https://github.com/psf/black
-    rev: stable
+    rev: 19.10b0 # Replace by any tag/version: https://github.com/psf/black/tags
     hooks:
       - id: black
-        language_version: python3.6
+        language_version: python3 # Should be a command that runs python3.6+
 ```
 
 Then run `pre-commit install` and you're ready to go.
@@ -429,7 +435,7 @@ code style: pytest, tox, Pyramid, Django Channels, Hypothesis, attrs, SQLAlchemy
 Poetry, PyPA applications (Warehouse, Bandersnatch, Pipenv, virtualenv), pandas, Pillow,
 every Datadog Agent Integration, Home Assistant.
 
-The following organizations use _Black_: Facebook, Dropbox.
+The following organizations use _Black_: Facebook, Dropbox, Mozilla, Quora.
 
 Are we missing anyone? Let us know.
 
@@ -458,7 +464,7 @@ Twisted and CPython:
 
 Use the badge in your project's README.md:
 
-```markdown
+```md
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 ```
 
@@ -542,6 +548,7 @@ Multiple contributions by:
 - [Christian Clauss](mailto:cclauss@bluewin.ch)
 - [Christian Heimes](mailto:christian@python.org)
 - [Chuck Wooters](mailto:chuck.wooters@microsoft.com)
+- [Chris Rose](mailto:offline@offby1.net)
 - Codey Oxley
 - [Cong](mailto:congusbongus@gmail.com)
 - [Cooper Ry Lees](mailto:me@cooperlees.com)
@@ -618,7 +625,7 @@ Multiple contributions by:
 - [Miroslav Shubernetskiy](mailto:miroslav@miki725.com)
 - MomIsBestFriend
 - [Nathan Goldbaum](mailto:ngoldbau@illinois.edu)
-- [Nathan Hunt](mailtoneighthan.hunt@gmail.com)
+- [Nathan Hunt](mailto:neighthan.hunt@gmail.com)
 - [Neraste](mailto:neraste.herr10@gmail.com)
 - [Nikolaus Waxweiler](mailto:madigens@gmail.com)
 - [Ofek Lev](mailto:ofekmeister@gmail.com)
@@ -677,3 +684,4 @@ Multiple contributions by:
 - Yazdan
 - [Yngve Høiseth](mailto:yngve@hoiseth.net)
 - [Yurii Karabas](mailto:1998uriyyo@gmail.com)
+- [Zac Hatfield-Dodds](mailto:zac@zhd.dev)

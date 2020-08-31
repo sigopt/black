@@ -89,7 +89,7 @@ Split functions
 
 .. autofunction:: black.standalone_comment_split
 
-.. autofunction:: black.split_line
+.. autofunction:: black.transform_line
 
 Caching
 -------
@@ -171,7 +171,7 @@ Utilities
 
 .. autofunction:: black.re_compile_maybe_verbose
 
-.. autofunction:: black.should_explode
+.. autofunction:: black.should_split_body_explode
 
 .. autofunction:: black.shutdown
 

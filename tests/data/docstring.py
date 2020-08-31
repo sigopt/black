@@ -46,7 +46,7 @@ def zort():
 
 def poit():
   """
-  Lorem ipsum dolor sit amet.
+  Lorem ipsum dolor sit amet.       
 
   Consectetur adipiscing elit:
    - sed do eiusmod tempor incididunt ut labore
@@ -54,6 +54,14 @@ def poit():
      - enim ad minim veniam
      - quis nostrud exercitation ullamco laboris nisi
    - aliquip ex ea commodo consequat
+  """
+  pass
+
+
+def under_indent():
+  """
+  These lines are indented in a way that does not
+make sense.
   """
   pass
 
@@ -72,6 +80,35 @@ def single_line():
 
     """
     pass
+
+
+def this():
+    r"""
+    'hey ho'
+    """
+
+
+def that():
+  """ "hey yah" """
+
+
+def and_that():
+  """
+  "hey yah" """
+
+
+def and_this():
+  ''' 
+  "hey yah"'''
+
+
+def believe_it_or_not_this_is_in_the_py_stdlib(): ''' 
+"hey yah"'''
+
+
+def ignored_docstring():
+    """a => \
+b"""  
 
 # output
 
@@ -136,6 +173,14 @@ def poit():
     pass
 
 
+def under_indent():
+    """
+      These lines are indented in a way that does not
+    make sense.
+    """
+    pass
+
+
 def over_indent():
     """
     This has a shallow indent
@@ -148,3 +193,33 @@ def over_indent():
 def single_line():
     """But with a newline after it!"""
     pass
+
+
+def this():
+    r"""
+    'hey ho'
+    """
+
+
+def that():
+    """ "hey yah" """
+
+
+def and_that():
+    """
+    "hey yah" """
+
+
+def and_this():
+    '''
+    "hey yah"'''
+
+
+def believe_it_or_not_this_is_in_the_py_stdlib():
+    '''
+    "hey yah"'''
+
+
+def ignored_docstring():
+    """a => \
+b"""
